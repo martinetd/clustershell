@@ -48,6 +48,7 @@ class EngineEPoll(Engine):
         Initialize Engine.
         """
         Engine.__init__(self, info)
+        self.extra_readfds = []
         try:
             # get an epoll object
             self.epolling = select.epoll()
@@ -66,7 +67,17 @@ class EngineEPoll(Engine):
             assert event & E_WRITE
             eventmask = select.EPOLLOUT
 
-        self.epolling.register(fd, eventmask)
+        try:
+            self.epolling.register(fd, eventmask)
+#        except PermissionError:
+        except IOError as err:
+            if err.errno != errno.EPERM:
+                raise
+            # file fd cannot be added to epoll as always available to read
+            if event & E_READ:
+                self.extra_readfds.append(fd)
+            else:
+                raise
 
     def _unregister_specific(self, fd, ev_is_set):
         """
@@ -74,7 +85,10 @@ class EngineEPoll(Engine):
         """
         self._debug("UNREGSPEC fd=%d ev_is_set=%x"% (fd, ev_is_set))
         if ev_is_set:
-            self.epolling.unregister(fd)
+            if fd in self.extra_readfds:
+                self.extra_readfds.remove(fd)
+            else:
+                self.epolling.unregister(fd)
 
     def _modify_specific(self, fd, event, setvalue):
         """
@@ -106,7 +120,9 @@ class EngineEPoll(Engine):
                      len(self.timerq)))
             try:
                 timeo = self.timerq.nextfire_delay()
-                if timeout > 0 and timeo >= timeout:
+                if self.extra_readfds:
+                    timeo = 0
+                elif timeout > 0 and timeo >= timeout:
                     # task timeout may invalidate clients timeout
                     self.timerq.clear()
                     timeo = timeout
@@ -125,6 +141,9 @@ class EngineEPoll(Engine):
                 # might get interrupted by a signal
                 if ex.errno == errno.EINTR:
                     continue
+
+            if not evlist:
+                evlist = [ (fd, select.EPOLLIN) for fd in self.extra_readfds ]
 
             for fd, event in evlist:
 

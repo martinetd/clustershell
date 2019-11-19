@@ -39,9 +39,11 @@ except ImportError:
     import Queue as queue
 
 import threading
+from getpass import getpass
 
 from ClusterShell.Worker.fastsubprocess import Popen, PIPE, STDOUT, \
     set_nonblock_flag
+from ClusterShell.CLI.Display import sys_stdin
 
 from ClusterShell.Engine.Engine import EngineBaseTimer, E_READ, E_WRITE
 
@@ -392,6 +394,10 @@ class EngineClient(EngineBaseTimer):
         lines = buf.splitlines(True)
         rfile.rbuf = bytes()
         for line in lines:
+            if line.startswith(b'[sudo] password for '):
+                passwd = getpass()
+                self._write('stdin', passwd + '\n')
+                continue
             if line.endswith(b'\n'):
                 if line.endswith(b'\r\n'):
                     yield line[:-2] # trim CRLF

@@ -58,6 +58,7 @@ from ClusterShell.CLI.Error import GENERIC_ERRORS, handle_generic_error
 from ClusterShell.CLI.Utils import bufnodeset_cmpkey, human_bi_bytes_unit
 
 from ClusterShell.Event import EventHandler
+from ClusterShell.Worker.Worker import StreamWorker
 from ClusterShell.MsgTree import MsgTree
 from ClusterShell.NodeSet import RESOLVER_NOGROUP, set_std_group_resolver_config
 from ClusterShell.NodeSet import NodeSet, NodeSetParseError, std_group_resolver
@@ -73,13 +74,23 @@ class StdInputHandler(EventHandler):
         EventHandler.__init__(self)
         self.master_worker = worker
 
-    def ev_msg(self, port, msg):
+    def ev_read(self, worker, node, sname, msg):
         """invoked when a message is received from port object"""
         if not msg:
             self.master_worker.set_write_eof()
             return
         # Forward messages to master worker
         self.master_worker.write(msg)
+
+    def ev_hup(self, worker, node, rc):
+        self.master_worker.set_write_eof()
+
+class StdInputWorker(EngineClient):
+    def __init__(self, master_worker):
+        handler = StdInputHandler(master_worker)
+        EngineClient.__init__(self, handler)
+        self.set_reader('stdin', sys_stdin())
+
 
 class OutputHandler(EventHandler):
     """Base class for generic output handlers."""
@@ -611,45 +622,6 @@ def ttyloop(task, nodeset, timeout, display, remote, trytree):
                 run_command(task, cmd, ns, timeout, display, remote, trytree)
     return rc
 
-def _stdin_thread_start(stdin_port, display):
-    """Standard input reader thread entry point."""
-    try:
-        # Note: read length should be as large as possible for performance
-        # yet not too large to not introduce artificial latency.
-        # 64k seems to be perfect with an openssh backend (they issue 64k
-        # reads) ; could consider making it an option for e.g. gsissh.
-        bufsize = 64 * 1024
-        # thread loop: blocking read stdin + send messages to specified
-        #              port object
-        buf = sys_stdin().read(bufsize)  # use buffer in Python 3
-        while buf:
-            # send message to specified port object (with ack)
-            stdin_port.msg(buf)
-            buf = sys_stdin().read(bufsize)
-    except IOError as ex:
-        display.vprint(VERB_VERB, "stdin: %s" % ex)
-    # send a None message to indicate EOF
-    stdin_port.msg(None)
-
-def bind_stdin(worker, display):
-    """Create a stdin->port->worker binding: connect specified worker
-    to stdin with the help of a reader thread and a ClusterShell Port
-    object."""
-    assert not sys.stdin.isatty()
-    # Create a ClusterShell Port object bound to worker's task. This object
-    # is able to receive messages in a thread-safe manner and then will safely
-    # trigger ev_msg() on a specified event handler.
-    port = worker.task.port(handler=StdInputHandler(worker), autoclose=True)
-    # Launch a dedicated thread to read stdin in blocking mode. Indeed stdin
-    # can be a file, so we cannot use a WorkerSimple here as polling on file
-    # may result in different behaviors depending on selected engine.
-    stdin_thread = threading.Thread(None, _stdin_thread_start, args=(port, display))
-    # setDaemon because we're sometimes left with data that has been read and
-    # ssh connection already closed.
-    # Syntax for compat with Python < 2.6
-    stdin_thread.setDaemon(True)
-    stdin_thread.start()
-
 def run_command(task, cmd, ns, timeout, display, remote, trytree):
     """
     Create and run the specified command line, displaying
@@ -679,8 +651,8 @@ def run_command(task, cmd, ns, timeout, display, remote, trytree):
                         remote=remote, tree=trytree)
     if ns is None:
         worker.set_key('LOCAL')
-    if task.default("USER_stdin_worker"):
-        bind_stdin(worker, display)
+    stdin_worker = StdInputWorker(worker)
+    task.schedule(stdin_worker)
 
     task.resume()
 
@@ -966,12 +938,6 @@ def main():
     task.set_default("USER_handle_SIGUSR1", user_interaction)
 
     task.excepthook = sys.excepthook
-    task.set_default("USER_stdin_worker", not (sys.stdin.isatty() or \
-                                               options.nostdin or \
-                                               user_interaction))
-    display.vprint(VERB_DEBUG, "Create STDIN worker: %s" % \
-                               task.default("USER_stdin_worker"))
-
     task.set_info("debug", config.verbosity >= VERB_DEBUG)
     task.set_info("fanout", config.fanout)
 
@@ -1031,7 +997,7 @@ def main():
     task.set_default("stderr", not options.gatherall)
 
     # Prevent reading from stdin?
-    task.set_default("stdin", not options.nostdin)
+    task.set_default("stdin", not (options.nostdin or user_interaction))
 
     # Disable MsgTree buffering if not gathering outputs
     task.set_default("stdout_msgtree", display.gather or display.line_mode)
